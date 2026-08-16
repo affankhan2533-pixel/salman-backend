@@ -49,7 +49,23 @@ app.use(mongoSanitize()); // Prevent NoSQL Injection attacks
 
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || 'http://localhost:3000',
+    origin: (origin, callback) => {
+      // Allow requests with no origin (server-to-server, curl, Postman)
+      if (!origin) return callback(null, true);
+
+      const allowedOrigins = [
+        process.env.CLIENT_URL || 'http://localhost:3000',
+        'http://localhost:3000',
+        'http://localhost:3001', // Next.js fallback port when 3000 is busy
+        'http://localhost:3002',
+      ];
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error(`CORS: Origin ${origin} not allowed`));
+    },
     credentials: true,
   })
 );
