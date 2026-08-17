@@ -4,11 +4,19 @@ const Gallery = require('../models/Gallery');
 
 const PROD_GALLERY = [
   {
+    title: 'Salman Hair Studio',
+    category: 'Salon',
+    imageUrl: '/images/image.png',
+    isVisible: true,
+    order: 0,
+    description: 'Kurla West Flagship Atelier & Grooming Sanctuary.',
+  },
+  {
     title: 'Signature Precision Fade & Sculpt',
     category: 'Haircuts',
     imageUrl: '/images/gallery/WhatsApp Image 2026-08-14 at 3.19.34 AM.jpeg',
     isVisible: true,
-    order: 0,
+    order: 1,
     description: 'Bespoke precision fade and beard sculpt.',
   },
   {
@@ -16,7 +24,7 @@ const PROD_GALLERY = [
     category: 'Haircuts',
     imageUrl: '/images/gallery/image.png',
     isVisible: true,
-    order: 1,
+    order: 2,
     description: 'Precision sculpted layers tailored to facial structure.',
   },
   {
