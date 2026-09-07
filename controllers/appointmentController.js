@@ -8,11 +8,19 @@ const Holiday = require('../models/Holiday');
 const { sendSuccess, sendError } = require('../utils/responseHandler');
 const asyncWrapper = require('../utils/asyncWrapper');
 const { triggerAppointmentNotification } = require('../services/notificationService');
+const {
+  BUSINESS_HOURS,
+  DEFAULT_SLOT_DURATION,
+  STEP_MINUTES,
+  TIMEZONE,
+  PENDING_HOLD_MINUTES: CONFIG_PENDING_HOLD,
+  BLOCKING_STATUSES: CONFIG_BLOCKING_STATUSES,
+} = require('../config/bookingConfig');
 
 // ---------------------------------------------------------------------------
 // PENDING HOLD CONFIG — single source of truth
 // ---------------------------------------------------------------------------
-const PENDING_HOLD_MINUTES = parseInt(process.env.PENDING_HOLD_MINUTES ?? '30', 10);
+const PENDING_HOLD_MINUTES = parseInt(process.env.PENDING_HOLD_MINUTES ?? String(CONFIG_PENDING_HOLD ?? 30), 10);
 
 // ---------------------------------------------------------------------------
 // Time conversion helpers
@@ -53,7 +61,8 @@ const minutesTo12h = (totalMins) => {
  * A pending appointment is "active" if it was created within the hold window.
  */
 const isPendingActive = (appointment) => {
-  if (appointment.appointmentStatus !== 'Pending') return false;
+  const status = appointment.appointmentStatus || appointment.status;
+  if (status !== 'Pending' && status !== 'pending') return false;
   if (PENDING_HOLD_MINUTES <= 0) return true; // hold disabled → block indefinitely
   if (appointment.pendingExpiresAt) {
     return new Date() < new Date(appointment.pendingExpiresAt);
@@ -69,7 +78,7 @@ const isPendingActive = (appointment) => {
  * Statuses that ACTIVELY block a slot for availability purposes.
  * Pending is handled separately via isPendingActive to respect expiry.
  */
-const BLOCKING_STATUSES = ['Confirmed', 'Checked In', 'In Progress'];
+const BLOCKING_STATUSES = CONFIG_BLOCKING_STATUSES || ['Pending', 'Confirmed', 'Checked In', 'In Progress'];
 
 // ---------------------------------------------------------------------------
 
@@ -87,32 +96,29 @@ exports.getAvailability = asyncWrapper(async (req, res) => {
   const holiday = await Holiday.findOne({ date });
   if (holiday) {
     return sendSuccess(res, `Salon is closed on ${date} (${holiday.reason})`, [], 200, {
+      date,
+      slots: [],
       isHoliday: true,
       reason: holiday.reason,
     });
   }
 
-  // 2. Resolve Service Duration (Default to 60 mins)
-  let duration = 60;
+  // 2. Resolve Service Duration (Default to 60 mins from config)
+  let duration = DEFAULT_SLOT_DURATION || 60;
   let serviceDoc = null;
   if (serviceInput && serviceInput.match(/^[0-9a-fA-F]{24}$/)) {
     serviceDoc = await Service.findById(serviceInput);
   } else if (serviceInput) {
     serviceDoc = await Service.findOne({
       $or: [
-        { title: { $regex: serviceInput.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), $options: 'i' } },
         { slug: serviceInput },
+        { title: { $regex: serviceInput.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), $options: 'i' } },
       ],
     });
   }
 
-  if (serviceDoc) {
-    duration = serviceDoc.duration || 60;
-  } else if (typeof serviceInput === 'string') {
-    if (/balayage|color/i.test(serviceInput)) duration = 150;
-    else if (/keratin/i.test(serviceInput)) duration = 180;
-    else if (/botox|restructuring|spa/i.test(serviceInput)) duration = 120;
-    else if (/bridal/i.test(serviceInput)) duration = 120;
+  if (serviceDoc && serviceDoc.duration) {
+    duration = serviceDoc.duration;
   }
 
   // 3. Resolve Stylist Filter
@@ -123,23 +129,22 @@ exports.getAvailability = asyncWrapper(async (req, res) => {
     stylistDoc = await Stylist.findOne({ name: { $regex: stylistInput, $options: 'i' } });
   }
 
-  // 4. Fetch appointments for date that COULD be blocking
-  // Include Pending so we can check expiry inline — avoids stale data issues
+  // 4. Fetch active appointments from Appointment collection (Single Source of Truth)
   const filter = {
     date,
-    appointmentStatus: { $in: [...BLOCKING_STATUSES, 'Pending'] },
+    appointmentStatus: { $in: ['Pending', 'Confirmed', 'Checked In', 'In Progress', 'pending', 'confirmed'] },
   };
   if (stylistDoc) filter.stylist = stylistDoc._id;
 
   const existingAppts = await Appointment.find(filter)
     .select('startTime endTime duration stylist appointmentStatus createdAt pendingExpiresAt');
 
-  // Build blocked intervals — only include Pending if still within hold window
+  // Build blocked intervals from active bookings
   const blockedIntervals = [];
   for (const app of existingAppts) {
     const isBlocking =
-      BLOCKING_STATUSES.includes(app.appointmentStatus) ||
-      (app.appointmentStatus === 'Pending' && isPendingActive(app));
+      ['Confirmed', 'Checked In', 'In Progress', 'confirmed'].includes(app.appointmentStatus) ||
+      (['Pending', 'pending'].includes(app.appointmentStatus) && isPendingActive(app));
     if (!isBlocking) continue;
 
     blockedIntervals.push({
@@ -150,8 +155,8 @@ exports.getAvailability = asyncWrapper(async (req, res) => {
     });
   }
 
-  // Fetch manual Slot blocks
-  const slotFilter = { date, status: { $in: ['booked', 'blocked'] } };
+  // 5. Fetch manual salon administrative blocks from Slot
+  const slotFilter = { date, status: 'blocked' };
   if (stylistDoc) slotFilter.stylist = stylistDoc._id;
   const blockedSlots = await Slot.find(slotFilter);
 
@@ -164,15 +169,15 @@ exports.getAvailability = asyncWrapper(async (req, res) => {
     });
   });
 
-  // 5. Standard Salon Operating Time Slots (10:00 AM – 11:00 PM in 30-min steps)
-  const openMins = 10 * 60;   // 10:00 AM
-  const closeMins = 23 * 60;  // 11:00 PM
-  const stepMins = 30;
+  // 6. Centralized Salon Operating Time Slots (10:00 AM – 11:00 PM)
+  const openMins = (BUSINESS_HOURS.openHour || 10) * 60;   // 10:00 AM
+  const closeMins = (BUSINESS_HOURS.closeHour || 23) * 60;  // 11:00 PM
+  const stepMins = STEP_MINUTES || 60;
 
   // Local IST check for past slots
   const now = new Date();
-  const todayStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-  const istTimeStr = now.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false });
+  const todayStr = now.toLocaleDateString('en-CA', { timeZone: TIMEZONE || 'Asia/Kolkata' });
+  const istTimeStr = now.toLocaleTimeString('en-GB', { timeZone: TIMEZONE || 'Asia/Kolkata', hour12: false });
   const currentIstMins = timeToMinutes(istTimeStr);
 
   const slots = [];
@@ -196,6 +201,7 @@ exports.getAvailability = asyncWrapper(async (req, res) => {
 
     slots.push({
       time: time12,
+      available: isAvailable,
       startTime: startTime24,
       endTime: endTime24,
       duration,
@@ -206,7 +212,10 @@ exports.getAvailability = asyncWrapper(async (req, res) => {
     });
   }
 
-  return sendSuccess(res, `Availability for ${date} calculated successfully`, slots);
+  return sendSuccess(res, `Availability for ${date} calculated successfully`, slots, 200, {
+    date,
+    slots,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -217,15 +226,15 @@ exports.getAvailability = asyncWrapper(async (req, res) => {
  * @access  Public
  */
 exports.createAppointment = asyncWrapper(async (req, res) => {
-  const name = (req.body.clientName || req.body.name || '').trim();
-  const email = (req.body.clientEmail || req.body.email || '').trim();
-  const phone = (req.body.clientPhone || req.body.phone || '').trim();
+  const customerName = (req.body.customerName || req.body.clientName || req.body.name || '').trim();
+  const phone = (req.body.phone || req.body.clientPhone || '').trim();
+  const email = (req.body.email || req.body.clientEmail || '').trim();
   const date = req.body.date;
-  const timeInput = req.body.startTime || req.body.time || '10:00';
+  const timeInput = req.body.time || req.body.startTime || '10:00 AM';
   const notes = req.body.notes || '';
 
-  if (!name || !email || !phone || !date) {
-    return sendError(res, 'Please provide all required fields (name, email, phone, date)', 400);
+  if (!customerName || !phone || !date) {
+    return sendError(res, 'Please provide all required fields (customerName, phone, date)', 400);
   }
 
   // 1. Holiday Check
@@ -234,48 +243,43 @@ exports.createAppointment = asyncWrapper(async (req, res) => {
     return sendError(res, `Booking unavailable: Salon is closed on ${date} (${holiday.reason})`, 400);
   }
 
-  // 2. Resolve Service
-  let serviceDoc;
-  const serviceInput = req.body.service;
-  if (serviceInput && serviceInput.match(/^[0-9a-fA-F]{24}$/)) {
+  // 2. Resolve Service from Database (Source of Truth - Never trust client price)
+  const serviceInput = req.body.serviceId || req.body.service || req.body.serviceName;
+  let serviceDoc = null;
+
+  if (serviceInput && typeof serviceInput === 'string' && serviceInput.match(/^[0-9a-fA-F]{24}$/)) {
     serviceDoc = await Service.findById(serviceInput);
   } else if (serviceInput && typeof serviceInput === 'string' && serviceInput.trim()) {
-    const trimmed = serviceInput.trim();
-    const slugStr = trimmed.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-
+    const cleanInput = serviceInput.trim();
+    const slugStr = cleanInput.toLowerCase().replace(/[^a-z0-9]+/g, '-');
     serviceDoc = await Service.findOne({
-      $or: [{ title: trimmed }, { slug: slugStr }],
-    });
-
-    if (!serviceDoc) {
-      let matchedDuration = 60;
-      let matchedPrice = 3500;
-      if (/balayage|color/i.test(trimmed)) { matchedDuration = 150; matchedPrice = 8500; }
-      else if (/keratin/i.test(trimmed)) { matchedDuration = 180; matchedPrice = 9000; }
-      else if (/botox|restructuring|spa/i.test(trimmed)) { matchedDuration = 120; matchedPrice = 10500; }
-      else if (/bridal/i.test(trimmed)) { matchedDuration = 120; matchedPrice = 15000; }
-
-      let defaultCat = await Category.findOne();
-      if (!defaultCat) {
-        defaultCat = await Category.create({
-          name: 'Haute Coiffure',
-          slug: 'haute-coiffure',
-          description: 'Bespoke salon services.',
-        });
-      }
-
-      serviceDoc = await Service.findOneAndUpdate(
+      $or: [
         { slug: slugStr },
-        { title: trimmed, slug: slugStr, category: defaultCat._id, price: matchedPrice, duration: matchedDuration, isActive: true },
-        { upsert: true, new: true }
-      );
-    }
+        { slug: cleanInput },
+        { title: { $regex: cleanInput.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), $options: 'i' } },
+      ],
+    });
+  }
+
+  // Fallback to first active service if not resolved
+  if (!serviceDoc) {
+    serviceDoc = await Service.findOne({ isActive: true });
+  }
+  if (!serviceDoc) {
+    serviceDoc = await Service.create({
+      title: 'Hair Cut',
+      slug: 'male-haircut',
+      category: 'Hair',
+      price: 500,
+      duration: 45,
+      isActive: true,
+    });
   }
 
   // 3. Resolve Stylist
   let stylistDoc;
-  const stylistInput = req.body.stylist;
-  if (stylistInput && stylistInput.match(/^[0-9a-fA-F]{24}$/)) {
+  const stylistInput = req.body.stylistId || req.body.stylist;
+  if (stylistInput && typeof stylistInput === 'string' && stylistInput.match(/^[0-9a-fA-F]{24}$/)) {
     stylistDoc = await Stylist.findById(stylistInput);
   } else if (stylistInput) {
     stylistDoc = await Stylist.findOne({ name: { $regex: stylistInput, $options: 'i' } });
@@ -285,39 +289,38 @@ exports.createAppointment = asyncWrapper(async (req, res) => {
     stylistDoc = await Stylist.create({ name: 'Salman Malik', title: 'Co-Owner & Master Hairstylist' });
   }
 
-  const duration = serviceDoc?.duration || 60;
+  const duration = serviceDoc?.duration || DEFAULT_SLOT_DURATION || 60;
   const startMins = timeToMinutes(timeInput);
   const endMins = startMins + duration;
   const startTime = minutesToHHMM(startMins);
   const endTime = minutesToHHMM(endMins);
 
   // 4. Operating Hours & Past Slot Validation
-  const openMins = 10 * 60;   // 10:00 AM
-  const closeMins = 23 * 60;  // 11:00 PM
+  const openMins = (BUSINESS_HOURS.openHour || 10) * 60;   // 10:00 AM
+  const closeMins = (BUSINESS_HOURS.closeHour || 23) * 60;  // 11:00 PM
   if (startMins < openMins || endMins > closeMins) {
     return sendError(res, 'Selected appointment time is outside salon operating hours (10:00 AM – 11:00 PM)', 400);
   }
 
   const now = new Date();
-  const todayStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-  const istTimeStr = now.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false });
+  const todayStr = now.toLocaleDateString('en-CA', { timeZone: TIMEZONE || 'Asia/Kolkata' });
+  const istTimeStr = now.toLocaleTimeString('en-GB', { timeZone: TIMEZONE || 'Asia/Kolkata', hour12: false });
   const currentIstMins = timeToMinutes(istTimeStr);
 
   if (date < todayStr || (date === todayStr && startMins <= currentIstMins)) {
     return sendError(res, 'Cannot book an appointment slot in the past.', 400);
   }
 
-  // 5. SERVER-SIDE INTERVAL OVERLAP CHECK (respects Pending expiry)
+  // 5. SERVER-SIDE INTERVAL OVERLAP CHECK (read-phase check)
   const existingAppts = await Appointment.find({
     date,
-    stylist: stylistDoc._id,
-    appointmentStatus: { $in: [...BLOCKING_STATUSES, 'Pending'] },
+    appointmentStatus: { $in: ['Pending', 'Confirmed', 'Checked In', 'In Progress', 'pending', 'confirmed'] },
   });
 
   const hasOverlap = existingAppts.some((app) => {
     const isBlocking =
-      BLOCKING_STATUSES.includes(app.appointmentStatus) ||
-      (app.appointmentStatus === 'Pending' && isPendingActive(app));
+      ['Confirmed', 'Checked In', 'In Progress', 'confirmed'].includes(app.appointmentStatus) ||
+      (['Pending', 'pending'].includes(app.appointmentStatus) && isPendingActive(app));
     if (!isBlocking) return false;
 
     const appStartMins = timeToMinutes(app.startTime);
@@ -328,45 +331,46 @@ exports.createAppointment = asyncWrapper(async (req, res) => {
   if (hasOverlap) {
     return res.status(409).json({
       success: false,
-      code: 'SLOT_UNAVAILABLE',
-      message: 'This appointment time has just been booked. Please choose another time.',
+      code: 'SLOT_ALREADY_BOOKED',
+      error: 'SLOT_ALREADY_BOOKED',
+      message: 'Sorry, this time slot has just been booked. Please choose another time.',
       data: null,
       errors: null,
     });
   }
 
-  // Check manual Slot table lock
-  const existingSlot = await Slot.findOne({
-    stylist: stylistDoc._id,
+  // Check manual administrative slot block
+  const existingBlock = await Slot.findOne({
     date,
     startTime,
-    status: { $in: ['booked', 'blocked'] },
+    status: 'blocked',
   });
-  if (existingSlot) {
+  if (existingBlock) {
     return res.status(409).json({
       success: false,
-      code: 'SLOT_UNAVAILABLE',
-      message: 'This appointment time has just been booked. Please choose another time.',
+      code: 'SLOT_ALREADY_BOOKED',
+      error: 'SLOT_ALREADY_BOOKED',
+      message: 'Sorry, this time slot has just been booked. Please choose another time.',
       data: null,
       errors: null,
     });
   }
 
-  // 6. ATOMIC RESERVATION LOCK
+  // 6. ATOMIC RESERVATION WITH DATABASE-LEVEL DUPLICATE KEY PROTECTION ON APPOINTMENT
   let createdAppointment;
   const pendingExpiresAt = PENDING_HOLD_MINUTES > 0
     ? new Date(Date.now() + PENDING_HOLD_MINUTES * 60 * 1000)
     : null;
 
   try {
-    await Slot.create({ stylist: stylistDoc._id, date, startTime, endTime, status: 'booked' });
-
     createdAppointment = await Appointment.create({
-      clientName: name,
-      clientEmail: email,
+      clientName: customerName,
       clientPhone: phone,
+      clientEmail: email,
       client: req.user ? req.user._id : null,
       service: serviceDoc._id,
+      serviceId: serviceDoc.slug || serviceDoc._id.toString(),
+      serviceName: serviceDoc.title,
       stylist: stylistDoc._id,
       date,
       startTime,
@@ -378,17 +382,13 @@ exports.createAppointment = asyncWrapper(async (req, res) => {
       appointmentStatus: 'Pending',
       pendingExpiresAt,
     });
-
-    await Slot.findOneAndUpdate(
-      { stylist: stylistDoc._id, date, startTime },
-      { appointment: createdAppointment._id }
-    );
   } catch (err) {
     if (err.code === 11000 || (err.message && err.message.includes('E11000'))) {
       return res.status(409).json({
         success: false,
-        code: 'SLOT_UNAVAILABLE',
-        message: 'This appointment time has just been booked. Please choose another time.',
+        code: 'SLOT_ALREADY_BOOKED',
+        error: 'SLOT_ALREADY_BOOKED',
+        message: 'Sorry, this time slot has just been booked. Please choose another time.',
         data: null,
         errors: null,
       });
@@ -397,25 +397,34 @@ exports.createAppointment = asyncWrapper(async (req, res) => {
   }
 
   const populated = await Appointment.findById(createdAppointment._id)
-    .populate('service', 'title category price duration')
+    .populate('service', 'title category price duration slug')
     .populate('stylist', 'name title avatar');
 
   triggerAppointmentNotification('NEW_APPOINTMENT', populated);
 
-  // Return only safe fields — no raw _id exposed to public
+  // Return formatted confirmation data
   return res.status(201).json({
     success: true,
-    message: 'Appointment reservation received. Awaiting confirmation.',
+    message: 'Appointment request received. Your selected time has been reserved and is awaiting confirmation.',
     data: {
+      id: populated._id,
       bookingRef: populated.bookingRef,
-      appointmentStatus: populated.appointmentStatus,
-      service: populated.service?.title,
+      customerName: populated.clientName,
+      clientName: populated.clientName,
+      phone: populated.clientPhone,
+      clientPhone: populated.clientPhone,
+      service: populated.service?.title || populated.serviceName,
+      serviceId: populated.serviceId || populated.service?.slug,
+      serviceName: populated.serviceName || populated.service?.title,
       stylist: populated.stylist?.name,
       date: populated.date,
+      time: minutesTo12h(timeToMinutes(populated.startTime)),
       startTime: populated.startTime,
       endTime: populated.endTime,
       duration: populated.duration,
       price: populated.price,
+      status: populated.appointmentStatus,
+      appointmentStatus: populated.appointmentStatus,
       pendingExpiresAt: populated.pendingExpiresAt,
     },
   });

@@ -25,18 +25,18 @@ const appointmentSchema = new mongoose.Schema(
     },
     clientName: {
       type: String,
-      required: [true, 'Client name is required'],
+      required: [true, 'Customer name is required'],
       trim: true,
     },
     clientEmail: {
       type: String,
-      required: [true, 'Client email is required'],
       lowercase: true,
       trim: true,
+      default: '',
     },
     clientPhone: {
       type: String,
-      required: [true, 'Client phone is required'],
+      required: [true, 'Phone number is required'],
       trim: true,
     },
     client: {
@@ -49,6 +49,16 @@ const appointmentSchema = new mongoose.Schema(
       ref: 'Service',
       required: [true, 'Service reference is required'],
     },
+    serviceId: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    serviceName: {
+      type: String,
+      default: '',
+      trim: true,
+    },
     stylist: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Stylist',
@@ -59,7 +69,7 @@ const appointmentSchema = new mongoose.Schema(
       required: [true, 'Appointment date is required'],
     },
     startTime: {
-      type: String, // HH:mm
+      type: String, // HH:mm or 12h representation
       required: [true, 'Start time is required'],
     },
     endTime: {
@@ -94,6 +104,10 @@ const appointmentSchema = new mongoose.Schema(
         'Cancelled',
         'No Show',
         'Expired',
+        'pending',
+        'confirmed',
+        'cancelled',
+        'completed',
       ],
       default: 'Pending',
     },
@@ -106,13 +120,44 @@ const appointmentSchema = new mongoose.Schema(
   },
   {
     timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
+  }
+);
+
+// Virtual aliases for clean multi-convention consumption
+appointmentSchema.virtual('customerName')
+  .get(function () { return this.clientName; })
+  .set(function (val) { this.clientName = val; });
+
+appointmentSchema.virtual('phone')
+  .get(function () { return this.clientPhone; })
+  .set(function (val) { this.clientPhone = val; });
+
+appointmentSchema.virtual('time')
+  .get(function () { return this.startTime; })
+  .set(function (val) { this.startTime = val; });
+
+appointmentSchema.virtual('status')
+  .get(function () { return this.appointmentStatus; })
+  .set(function (val) { this.appointmentStatus = val; });
+
+// DATABASE-LEVEL DOUBLE-BOOKING PROTECTION:
+// Partial unique compound index on date + startTime strictly for active statuses.
+// Cancelled and Completed appointments are excluded, freeing the slot automatically.
+appointmentSchema.index(
+  { date: 1, startTime: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      appointmentStatus: { $in: ['Pending', 'Confirmed', 'Checked In', 'In Progress', 'pending', 'confirmed'] },
+    },
   }
 );
 
 appointmentSchema.index({ date: 1, stylist: 1 });
 appointmentSchema.index({ date: 1, appointmentStatus: 1 });
 appointmentSchema.index({ clientPhone: 1 });
-// bookingRef index is created automatically from the schema field { unique: true, sparse: true }
 
 module.exports = mongoose.model('Appointment', appointmentSchema);
 module.exports.generateBookingRef = generateBookingRef;

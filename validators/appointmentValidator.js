@@ -3,19 +3,23 @@ const { z } = require('zod');
 const createAppointmentSchema = z.object({
   body: z.object({
     clientName: z.string().min(2, 'Name must be at least 2 characters').optional(),
-    clientEmail: z.string().email('Invalid email address format').optional(),
-    clientPhone: z.string().min(8, 'Phone number is required').optional(),
+    customerName: z.string().min(2, 'Name must be at least 2 characters').optional(),
+    name: z.string().min(2, 'Name must be at least 2 characters').optional(),
 
-    // Backwards compatibility legacy field names
-    name: z.string().optional(),
-    email: z.string().email().optional(),
-    phone: z.string().optional(),
+    clientPhone: z.string().min(8, 'Phone number must be at least 8 digits').optional(),
+    phone: z.string().min(8, 'Phone number must be at least 8 digits').optional(),
 
-    service: z.string({ required_error: 'Service ID or name is required' }),
+    clientEmail: z.string().email('Invalid email address format').optional().or(z.literal('')),
+    email: z.string().email('Invalid email address format').optional().or(z.literal('')),
+
+    service: z.string().optional(),
+    serviceId: z.string().optional(),
+    serviceName: z.string().optional(),
+
     stylist: z.string().optional(),
     date: z.string({ required_error: 'Date (YYYY-MM-DD) is required' }),
     startTime: z.string().optional(),
-    time: z.string().optional(), // Legacy field name
+    time: z.string().optional(),
     notes: z.string().optional(),
   }),
 });
@@ -31,6 +35,10 @@ const statusEnum = z.enum([
   'Expired',
   'Accepted', // Legacy status map -> Confirmed
   'Rejected', // Legacy status map -> Cancelled
+  'pending',
+  'confirmed',
+  'cancelled',
+  'completed',
 ]);
 
 const updateAppointmentStatusSchema = z.object({
