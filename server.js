@@ -54,11 +54,22 @@ app.use(
       if (!origin) return callback(null, true);
 
       const allowedOrigins = [
-        process.env.CLIENT_URL || 'http://localhost:3000',
+        'https://salmanhairstudio.com',
+        'https://www.salmanhairstudio.com',
         'http://localhost:3000',
-        'http://localhost:3001', // Next.js fallback port when 3000 is busy
+        'http://localhost:3001',
         'http://localhost:3002',
+        'http://127.0.0.1:3000',
       ];
+
+      if (process.env.CLIENT_URL) {
+        process.env.CLIENT_URL.split(',').forEach((url) => {
+          const trimmed = url.trim();
+          if (trimmed && !allowedOrigins.includes(trimmed)) {
+            allowedOrigins.push(trimmed);
+          }
+        });
+      }
 
       if (allowedOrigins.includes(origin)) {
         return callback(null, true);
