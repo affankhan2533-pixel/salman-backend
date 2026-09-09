@@ -1,3 +1,5 @@
+const http = require('http');
+const { Server } = require('socket.io');
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
@@ -32,6 +34,7 @@ const backupRoutes = require('./routes/backupRoutes');
 const errorHandler = require('./middleware/errorHandler');
 
 const app = express();
+const server = http.createServer(app);
 const PORT = process.env.PORT || 5000;
 
 // Connect MongoDB Database
@@ -47,39 +50,64 @@ app.use(compression());
 app.use(cookieParser());
 app.use(mongoSanitize()); // Prevent NoSQL Injection attacks
 
+const allowedOrigins = [
+  'https://salmanhairstudio.com',
+  'https://www.salmanhairstudio.com',
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:3002',
+  'http://127.0.0.1:3000',
+];
+
+if (process.env.CLIENT_URL) {
+  process.env.CLIENT_URL.split(',').forEach((url) => {
+    const trimmed = url.trim();
+    if (trimmed && !allowedOrigins.includes(trimmed)) {
+      allowedOrigins.push(trimmed);
+    }
+  });
+}
+
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (server-to-server, curl, Postman)
       if (!origin) return callback(null, true);
-
-      const allowedOrigins = [
-        'https://salmanhairstudio.com',
-        'https://www.salmanhairstudio.com',
-        'http://localhost:3000',
-        'http://localhost:3001',
-        'http://localhost:3002',
-        'http://127.0.0.1:3000',
-      ];
-
-      if (process.env.CLIENT_URL) {
-        process.env.CLIENT_URL.split(',').forEach((url) => {
-          const trimmed = url.trim();
-          if (trimmed && !allowedOrigins.includes(trimmed)) {
-            allowedOrigins.push(trimmed);
-          }
-        });
-      }
-
       if (allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
-
       return callback(new Error(`CORS: Origin ${origin} not allowed`));
     },
     credentials: true,
   })
 );
+
+// Initialize Socket.io Server
+const io = new Server(server, {
+  cors: {
+    origin: allowedOrigins,
+    credentials: true,
+    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+  },
+  pingTimeout: 30000,
+  pingInterval: 25000,
+});
+
+app.set('io', io);
+
+io.on('connection', (socket) => {
+  socket.on('subscribe_date', (date) => {
+    if (date) {
+      socket.join(`date:${date}`);
+    }
+  });
+
+  socket.on('unsubscribe_date', (date) => {
+    if (date) {
+      socket.leave(`date:${date}`);
+    }
+  });
+});
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -117,12 +145,13 @@ app.use('/api/backup', backupRoutes);
 // Centralized Error Handler
 app.use(errorHandler);
 
-const server = app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(
     `[Express Production Server] Running on port ${PORT} in ${
       process.env.NODE_ENV || 'development'
     } mode`
   );
+  console.log(`[Socket.io Engine] Initialized and listening`);
   console.log(`[Swagger Docs] Live at http://localhost:${PORT}/api-docs`);
 });
 
@@ -139,3 +168,4 @@ process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 process.on('SIGINT', () => handleShutdown('SIGINT'));
 
 module.exports = app;
+

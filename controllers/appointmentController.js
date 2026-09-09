@@ -402,6 +402,24 @@ exports.createAppointment = asyncWrapper(async (req, res) => {
 
   triggerAppointmentNotification('NEW_APPOINTMENT', populated);
 
+  // Broadcast Socket.io event to live connected clients
+  try {
+    const io = req.app.get('io');
+    if (io) {
+      const eventPayload = {
+        date: populated.date,
+        time: minutesTo12h(timeToMinutes(populated.startTime)),
+        startTime: populated.startTime,
+        endTime: populated.endTime,
+        bookingRef: populated.bookingRef,
+      };
+      io.to(`date:${populated.date}`).emit('slot_booked', eventPayload);
+      io.emit('slot_booked', eventPayload);
+    }
+  } catch (socketErr) {
+    console.error('[Socket Broadcast Error]', socketErr);
+  }
+
   // Return formatted confirmation data
   return res.status(201).json({
     success: true,
@@ -426,6 +444,7 @@ exports.createAppointment = asyncWrapper(async (req, res) => {
       status: populated.appointmentStatus,
       appointmentStatus: populated.appointmentStatus,
       pendingExpiresAt: populated.pendingExpiresAt,
+      createdAt: populated.createdAt,
     },
   });
 });
@@ -703,6 +722,23 @@ exports.updateAppointmentStatus = asyncWrapper(async (req, res) => {
   else if (newStatus === 'Cancelled') triggerAppointmentNotification('APPOINTMENT_CANCELLED', updated);
   else if (newStatus === 'Completed') triggerAppointmentNotification('APPOINTMENT_COMPLETED', updated);
 
+  try {
+    const io = req.app.get('io');
+    if (io) {
+      const eventName = ['Cancelled', 'No Show', 'Expired'].includes(newStatus) ? 'slot_released' : 'booking_updated';
+      const payload = {
+        date: appointment.date,
+        startTime: appointment.startTime,
+        status: newStatus,
+        bookingRef: appointment.bookingRef,
+      };
+      io.to(`date:${appointment.date}`).emit(eventName, payload);
+      io.emit(eventName, payload);
+    }
+  } catch (err) {
+    console.error('[Socket Broadcast Error]', err);
+  }
+
   return sendSuccess(res, `Appointment status updated to ${newStatus}`, updated);
 });
 
@@ -718,6 +754,8 @@ exports.rescheduleAppointment = asyncWrapper(async (req, res) => {
 
   let appointment = await Appointment.findById(req.params.id);
   if (!appointment) return sendError(res, 'Appointment not found', 404);
+
+  const oldDate = appointment.date;
 
   const holiday = await Holiday.findOne({ date });
   if (holiday) {
@@ -761,6 +799,18 @@ exports.rescheduleAppointment = asyncWrapper(async (req, res) => {
     .populate('stylist', 'name');
 
   triggerAppointmentNotification('APPOINTMENT_RESCHEDULED', updated);
+
+  try {
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`date:${oldDate}`).emit('slot_released', { date: oldDate, startTime: appointment.startTime });
+      io.to(`date:${date}`).emit('slot_booked', { date, startTime, bookingRef: appointment.bookingRef });
+      io.emit('booking_updated', { date, startTime, bookingRef: appointment.bookingRef });
+    }
+  } catch (err) {
+    console.error('[Socket Broadcast Error]', err);
+  }
+
   return sendSuccess(res, 'Appointment rescheduled successfully', updated);
 });
 
@@ -786,6 +836,23 @@ exports.cancelAppointment = asyncWrapper(async (req, res) => {
   });
 
   triggerAppointmentNotification('APPOINTMENT_CANCELLED', appointment);
+
+  try {
+    const io = req.app.get('io');
+    if (io) {
+      const payload = {
+        date: appointment.date,
+        startTime: appointment.startTime,
+        status: 'Cancelled',
+        bookingRef: appointment.bookingRef,
+      };
+      io.to(`date:${appointment.date}`).emit('slot_released', payload);
+      io.emit('slot_released', payload);
+    }
+  } catch (err) {
+    console.error('[Socket Broadcast Error]', err);
+  }
+
   return sendSuccess(res, 'Appointment cancelled and slot released successfully');
 });
 
