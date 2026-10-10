@@ -53,6 +53,7 @@ app.use(mongoSanitize()); // Prevent NoSQL Injection attacks
 const allowedOrigins = [
   'https://salmanhairstudio.com',
   'https://www.salmanhairstudio.com',
+  'https://salman-frontend-git-audit-production-recovery-2026-10-09-affan-s-projects.vercel.app',
   'http://localhost:3000',
   'http://localhost:3001',
   'http://localhost:3002',
@@ -68,11 +69,18 @@ if (process.env.CLIENT_URL) {
   });
 }
 
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  if (allowedOrigins.includes(origin)) return true;
+  // Allow official Vercel preview deployments for salman-frontend
+  if (/^https:\/\/salman-frontend[a-z0-9-]*\.vercel\.app$/.test(origin)) return true;
+  return false;
+};
+
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) {
+      if (isAllowedOrigin(origin)) {
         return callback(null, true);
       }
       return callback(new Error(`CORS: Origin ${origin} not allowed`));
@@ -84,7 +92,12 @@ app.use(
 // Initialize Socket.io Server
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error(`CORS: Origin ${origin} not allowed`));
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
   },
